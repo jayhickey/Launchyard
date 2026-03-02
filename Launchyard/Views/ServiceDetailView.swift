@@ -18,14 +18,19 @@ struct ServiceDetailView: View {
                         ServiceEditorView(service: service) { dict, rawXML, useRaw in
                             viewModel.saveEditedService(dictionary: dict, rawXML: rawXML, useRawXML: useRaw)
                         }
+                        .id("\(service.plistURL)\(viewModel.editorVersion)")
+
                     case .logs:
-                        LogViewerView(text: viewModel.logsText) {
+                        LogViewerView(service: service, stdoutText: viewModel.stdoutText, stderrText: viewModel.stderrText, unifiedText: viewModel.unifiedLogText, isLoading: viewModel.logsLoading, isInitialLoad: viewModel.logsInitialLoad) {
                             viewModel.reloadLogs()
                         }
                     }
                 }
                 .padding()
                 .onChange(of: viewModel.selectedService?.plistURL) { _, _ in
+                    viewModel.stdoutText = ""
+                    viewModel.stderrText = ""
+                    viewModel.unifiedLogText = ""
                     selectedTab = .editor
                 }
             } else {

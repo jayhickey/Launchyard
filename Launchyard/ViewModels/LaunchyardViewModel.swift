@@ -22,7 +22,12 @@ class LaunchyardViewModel: ObservableObject {
     @Published var isLoading = false
     @Published var isWorking = false
     @Published var actionStatus: ActionStatus?
-    @Published var logsText: String = ""
+    @Published var stdoutText: String = ""
+    @Published var stderrText: String = ""
+    @Published var unifiedLogText: String = ""
+    @Published var logsLoading: Bool = false
+    @Published var editorVersion: Int = 0
+    @Published var logsInitialLoad: Bool = true
     @Published var infoMessage: String?
     @Published var errorMessage: String?
 
@@ -193,14 +198,22 @@ class LaunchyardViewModel: ObservableObject {
 
     func reloadLogs() {
         guard let service = selectedService else {
-            logsText = ""
+            stdoutText = ""
+            stderrText = ""
+            unifiedLogText = ""
+            logsInitialLoad = true
             return
         }
-        logsText = "Loading logs..."
+        logsInitialLoad = stdoutText.isEmpty && stderrText.isEmpty && unifiedLogText.isEmpty
+        logsLoading = true
         Task.detached {
-            let logs = LaunchctlService.loadLogs(service: service)
+            let result = LaunchctlService.loadLogsSplit(service: service)
             await MainActor.run { [weak self] in
-                self?.logsText = logs
+                self?.stdoutText = result.stdout
+                self?.stderrText = result.stderr
+                self?.unifiedLogText = result.unified
+                self?.logsLoading = false
+                self?.logsInitialLoad = false
             }
         }
     }
@@ -223,9 +236,21 @@ class LaunchyardViewModel: ObservableObject {
 
             try PlistEditorService.validate(dictionary: finalDict)
             try PlistEditorService.writePlist(dictionary: finalDict, to: service.plistURL)
+            
+            // Re-read from disk (file is source of truth)
+            let freshDict = try PlistEditorService.readPlist(at: service.plistURL)
+            var updatedService = service
+            updatedService.plistDictionary = freshDict
+            
+            // Update in services array
+            if let idx = services.firstIndex(where: { $0.plistURL == service.plistURL }) {
+                services[idx] = updatedService
+            }
+            selectedService = updatedService
+            editorVersion += 1
+            
             infoMessage = "Saved \(service.plistURL.lastPathComponent)."
             errorMessage = nil
-            refresh()
         } catch {
             errorMessage = error.localizedDescription
         }

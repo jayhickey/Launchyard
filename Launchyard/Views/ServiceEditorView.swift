@@ -8,6 +8,9 @@ struct ServiceEditorView: View {
     @State private var rawXML: String
     @State private var useRawEditor: Bool = false
     @State private var validationMessage: String?
+    @State private var autoSaveTask: Task<Void, Never>?
+    @State private var hasUnsavedXML: Bool = false
+    @State private var draftVersion: Int = 0
 
     init(service: LaunchService, onSave: @escaping ([String: Any], String?, Bool) -> Void) {
         self.service = service
@@ -38,8 +41,12 @@ struct ServiceEditorView: View {
                     .frame(minHeight: 260)
                     .overlay {
                         RoundedRectangle(cornerRadius: 6)
-                            .stroke(.quaternary)
+                            .stroke(hasUnsavedXML ? Color.orange : Color.gray.opacity(0.3))
                     }
+                    .onChange(of: rawXML) { _, _ in
+                        hasUnsavedXML = true
+                    }
+
             } else {
                 Form {
                     ForEach(fieldCategories, id: \.self) { category in
@@ -57,6 +64,14 @@ struct ServiceEditorView: View {
                 .scrollContentBackground(.hidden)
                 .padding(.horizontal, -18)
                 .padding(.top, -12)
+                .onChange(of: draftVersion) { _, _ in
+                    autoSaveTask?.cancel()
+                    autoSaveTask = Task {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run { saveWYSIWYG() }
+                    }
+                }
             }
 
             HStack {
@@ -85,15 +100,20 @@ struct ServiceEditorView: View {
                         .font(.caption)
                         .foregroundStyle(validationMessage == "Validation passed." ? .green : .red)
                 }
-                Button("Validate") {
-                    validateOnly()
+                if useRawEditor {
+                    if hasUnsavedXML {
+                        Text("Unsaved changes")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    Button("Save") {
+                        saveXML()
+                    }
+                    .keyboardShortcut("s", modifiers: .command)
                 }
-                Button("Save") {
-                    save()
-                }
-                .keyboardShortcut(.defaultAction)
             }
         }
+
         .onChange(of: service.id) { _, _ in
             draft = LaunchPlistDraft.from(dictionary: service.plistDictionary)
             rawXML = (try? PlistEditorService.xmlString(from: service.plistDictionary)) ?? ""
@@ -151,12 +171,14 @@ struct ServiceEditorView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             TextField("", value: $draft.intervalSeconds, format: .number)
+                                .onChange(of: draft.intervalSeconds) { _, _ in }
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 80)
                             Text("seconds")
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Stepper("", value: $draft.intervalSeconds, in: 1...604_800)
+                                .onChange(of: draft.intervalSeconds) { _, _ in draftVersion += 1 }
                                 .labelsHidden()
                         }
 
@@ -277,28 +299,28 @@ struct ServiceEditorView: View {
     private func stringBinding(for key: String) -> Binding<String> {
         Binding(
             get: { draft.stringValue(for: key) },
-            set: { draft.setStringValue(for: key, value: $0) }
+            set: { draft.setStringValue(for: key, value: $0); draftVersion += 1 }
         )
     }
 
     private func boolBinding(for key: String) -> Binding<Bool> {
         Binding(
             get: { draft.boolValue(for: key) },
-            set: { draft.setBoolValue(for: key, value: $0) }
+            set: { draft.setBoolValue(for: key, value: $0); draftVersion += 1 }
         )
     }
 
     private func intBinding(for key: String) -> Binding<Int> {
         Binding(
             get: { draft.intValue(for: key) },
-            set: { draft.setIntValue(for: key, value: $0) }
+            set: { draft.setIntValue(for: key, value: $0); draftVersion += 1 }
         )
     }
 
     private func arrayBinding(for key: String) -> Binding<[String]> {
         Binding(
             get: { draft.stringArrayValue(for: key) },
-            set: { draft.setStringArrayValue(for: key, values: $0) }
+            set: { draft.setStringArrayValue(for: key, values: $0); draftVersion += 1 }
         )
     }
 
@@ -314,7 +336,7 @@ struct ServiceEditorView: View {
                 for entry in entries {
                     dict[entry.key] = entry.value
                 }
-                draft.setStringDictionaryValue(for: key, values: dict)
+                draft.setStringDictionaryValue(for: key, values: dict); draftVersion += 1
             }
         )
     }
@@ -334,17 +356,24 @@ struct ServiceEditorView: View {
         }
     }
 
-    private func save() {
+    private func saveWYSIWYG() {
         do {
             let dict = try draft.toDictionary()
-            if useRawEditor {
-                let parsed = try PlistEditorService.dictionary(fromRawXML: rawXML)
-                try PlistEditorService.validate(dictionary: parsed)
-            } else {
-                try PlistEditorService.validate(dictionary: dict)
-            }
+            try PlistEditorService.validate(dictionary: dict)
             validationMessage = nil
-            onSave(dict, rawXML, useRawEditor)
+            onSave(dict, nil, false)
+        } catch {
+            validationMessage = error.localizedDescription
+        }
+    }
+
+    private func saveXML() {
+        do {
+            let parsed = try PlistEditorService.dictionary(fromRawXML: rawXML)
+            try PlistEditorService.validate(dictionary: parsed)
+            validationMessage = nil
+            hasUnsavedXML = false
+            onSave([:], rawXML, true)
         } catch {
             validationMessage = error.localizedDescription
         }
@@ -568,14 +597,29 @@ private struct KeyValueEntry: Identifiable, Hashable {
 
 private struct StringArrayFieldEditor: View {
     @Binding var values: [String]
+    @State private var editableItems: [EditableItem] = []
+    @State private var isSyncing = false
+
+    struct EditableItem: Identifiable {
+        let id = UUID()
+        var value: String
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(values.enumerated()), id: \.offset) { index, _ in
+            ForEach($editableItems) { $item in
                 HStack {
-                    TextField("Value", text: binding(for: index))
+                    TextField("Value", text: $item.value)
+                        .onChange(of: item.value) { _, _ in
+                            isSyncing = true
+                            syncBack()
+                            isSyncing = false
+                        }
                     Button(role: .destructive) {
-                        values.remove(at: index)
+                        withAnimation {
+                            editableItems.removeAll { $0.id == item.id }
+                            syncBack()
+                        }
                     } label: {
                         Image(systemName: "minus.circle")
                     }
@@ -584,18 +628,26 @@ private struct StringArrayFieldEditor: View {
             }
 
             Button {
-                values.append("")
+                editableItems.append(EditableItem(value: ""))
+                syncBack()
             } label: {
                 Label("Add Item", systemImage: "plus")
             }
         }
+        .onAppear {
+            editableItems = values.map { EditableItem(value: $0) }
+        }
+        .onChange(of: values) { _, newValues in
+            guard !isSyncing else { return }
+            let currentValues = editableItems.map { $0.value }
+            if currentValues != newValues {
+                editableItems = newValues.map { EditableItem(value: $0) }
+            }
+        }
     }
 
-    private func binding(for index: Int) -> Binding<String> {
-        Binding(
-            get: { values[index] },
-            set: { values[index] = $0 }
-        )
+    private func syncBack() {
+        values = editableItems.map { $0.value }
     }
 }
 

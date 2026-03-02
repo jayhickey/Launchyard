@@ -241,6 +241,49 @@ enum LaunchctlService {
         return sections.joined(separator: "\n\n")
     }
 
+    static func loadLogsSplit(service: LaunchService) -> (stdout: String, stderr: String, unified: String) {
+        var stdout = ""
+        var stderr = ""
+        var unified = ""
+
+        if let outPath = service.plistDictionary.standardOutPath {
+            let expanded = NSString(string: outPath).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded),
+               let data = FileManager.default.contents(atPath: expanded),
+               let text = String(data: data, encoding: .utf8) {
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(500)
+                stdout = lines.joined(separator: "\n")
+            } else {
+                stdout = "File not found: \(expanded)"
+            }
+        }
+
+        if let errPath = service.plistDictionary.standardErrorPath {
+            let expanded = NSString(string: errPath).expandingTildeInPath
+            if FileManager.default.fileExists(atPath: expanded),
+               let data = FileManager.default.contents(atPath: expanded),
+               let text = String(data: data, encoding: .utf8) {
+                let lines = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(500)
+                stderr = lines.joined(separator: "\n")
+            } else {
+                stderr = "File not found: \(expanded)"
+            }
+        }
+
+        if stdout.isEmpty && stderr.isEmpty {
+            let predicate = "eventMessage CONTAINS \"\(service.label.replacingOccurrences(of: "\"", with: "\\\""))\""
+            let args = ["show", "--last", "1h", "--style", "compact", "--predicate", predicate]
+            if let result = try? CommandRunner.run("/usr/bin/log", arguments: args), result.isSuccess {
+                let lines = result.stdout.split(separator: "\n").suffix(200)
+                unified = lines.joined(separator: "\n")
+            } else {
+                unified = "No log file paths found and unified log query returned no results."
+            }
+        }
+
+        return (stdout, stderr, unified)
+    }
+
     private static func readLogFileSection(path: String, title: String) -> [String] {
         let expanded = NSString(string: path).expandingTildeInPath
         guard FileManager.default.fileExists(atPath: expanded) else {
